@@ -9,3 +9,4 @@
 - `05-page-design.md`：页面、路由和交互状态
 - `06-exception-and-test-plan.md`：异常场景与测试计划
 - `07-system-boundary.md`：系统边界图和核心流程图
+- `08-week2-implementation.md`：Week 2 实现范围、文件职责和验收方式
