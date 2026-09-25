@@ -62,7 +62,7 @@ curl -F 'file=@./sample.csv' -F 'name=示例导入' http://localhost:8000/api/v1
 - `backend/worker/`：Redis 消费和任务状态更新
 - `backend/migrations/`：可重复执行的 MySQL 初始化脚本
 - `frontend/src/`：React Web 页面
-- `docs/`：Week 1 规范设计包
+- `docs/`：Week 1 规范设计包和 Week 2 实现记录
 - `data/uploads/`：本地受控上传目录，不提交到仓库
 
 ## 开发检查

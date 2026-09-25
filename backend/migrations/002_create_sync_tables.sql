@@ -37,11 +37,11 @@ CREATE TABLE IF NOT EXISTS sync_records (
 CREATE TABLE IF NOT EXISTS sync_errors (
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
     job_id VARCHAR(36) NOT NULL,
-    row_number INT UNSIGNED NULL,
+    `row_number` INT UNSIGNED NULL,
     field_name VARCHAR(64) NULL,
     error_code VARCHAR(64) NOT NULL,
     error_message VARCHAR(512) NOT NULL,
     raw_row JSON NULL,
     created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-    KEY idx_sync_errors_job_row (job_id, row_number)
+    KEY idx_sync_errors_job_row (job_id, `row_number`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
