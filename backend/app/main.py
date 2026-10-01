@@ -1,4 +1,5 @@
 import hashlib
+import json
 import logging
 import os
 import uuid
@@ -19,6 +20,7 @@ from app.db import (
     get_job,
     get_job_by_idempotency_key,
     insert_job,
+    list_job_errors,
     list_jobs as db_list_jobs,
     mark_job_failed,
 )
@@ -28,7 +30,7 @@ logger = logging.getLogger("syncflow.api")
 
 app = FastAPI(
     title="SyncFlow API",
-    version="0.2.0",
+    version="1.0.0",
     description="CSV 数据同步任务管理 API。",
 )
 
@@ -70,6 +72,16 @@ class JobResponse(BaseModel):
     created_at: str
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
+
+
+class ErrorResponse(BaseModel):
+    job_id: str
+    row_number: Optional[int] = None
+    field_name: Optional[str] = None
+    error_code: str
+    error_message: str
+    raw_row: Any = None
+    created_at: str
 
 
 ResponseData = TypeVar("ResponseData")
@@ -158,6 +170,24 @@ def serialize_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "created_at": format_datetime(job["created_at"]),
         "started_at": format_datetime(job["started_at"]),
         "finished_at": format_datetime(job["finished_at"]),
+    }
+
+
+def serialize_error(error: Dict[str, Any]) -> Dict[str, Any]:
+    raw_row = error.get("raw_row")
+    if isinstance(raw_row, str):
+        try:
+            raw_row = json.loads(raw_row)
+        except json.JSONDecodeError:
+            pass
+    return {
+        "job_id": error["job_id"],
+        "row_number": error["row_number"],
+        "field_name": error["field_name"],
+        "error_code": error["error_code"],
+        "error_message": error["error_message"],
+        "raw_row": raw_row,
+        "created_at": format_datetime(error["created_at"]),
     }
 
 
@@ -278,6 +308,24 @@ def create_job(
 @app.get("/api/v1/jobs/{job_id}", response_model=ApiResponse[JobResponse], tags=["jobs"])
 def get_job_detail(job_id: str):
     return {"data": serialize_job(get_job_or_error(job_id)), "meta": {}}
+
+
+@app.get(
+    "/api/v1/jobs/{job_id}/errors",
+    response_model=ApiResponse[List[ErrorResponse]],
+    tags=["jobs"],
+)
+def get_job_errors(
+    job_id: str,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    get_job_or_error(job_id)
+    errors, total = list_job_errors(job_id, page=page, page_size=page_size)
+    return {
+        "data": [serialize_error(error) for error in errors],
+        "meta": {"page": page, "page_size": page_size, "total": total},
+    }
 
 
 @app.get("/api/v1/jobs", response_model=ApiResponse[List[JobResponse]], tags=["jobs"])
