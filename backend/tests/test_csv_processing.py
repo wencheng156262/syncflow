@@ -45,6 +45,23 @@ def test_parse_csv_rejects_invalid_header(tmp_path):
     }
 
 
+def test_parse_csv_reserves_valid_external_id_even_when_other_fields_are_invalid(tmp_path):
+    path = write_csv(
+        tmp_path,
+        "external_id,name,amount,record_date\n"
+        "A,first,not-a-number,2026-01-01\n"
+        "a,second,1,2026-01-01\n",
+    )
+
+    result = parse_csv_file(path)
+
+    assert result.records == []
+    assert [error["error_code"] for error in result.errors] == [
+        "AMOUNT_INVALID",
+        "EXTERNAL_ID_DUPLICATE",
+    ]
+
+
 def test_parse_csv_rejects_empty_file_and_row_limit(tmp_path):
     empty_result = parse_csv_file(write_csv(tmp_path, "external_id,name,amount,record_date\n"))
     too_many_result = parse_csv_file(

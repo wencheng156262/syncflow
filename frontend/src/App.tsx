@@ -280,7 +280,7 @@ function JobDetailPage() {
               <DetailItem label="重试次数" value={String(job.retry_count)} />
             </div>
             {job.last_error_message && <div className="last-error"><strong>{job.last_error_code ?? '处理错误'}</strong><span>{job.last_error_message}</span></div>}
-            {job.failed_records > 0 && <Link className="secondary-button error-link" to={`/jobs/${job.id}/errors`}>查看错误明细</Link>}
+            {(job.failed_records > 0 || job.last_error_code !== null) && <Link className="secondary-button error-link" to={`/jobs/${job.id}/errors`}>查看错误明细</Link>}
           </div>
           <button className="secondary-button refresh-detail" type="button" onClick={() => void loadJob()}>刷新详情</button>
         </>

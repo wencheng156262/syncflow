@@ -122,11 +122,15 @@ def _validate_row(
             except ValueError:
                 errors.append(_error(row_number, "record_date", "DATE_INVALID", "record_date 不是有效日期", raw_row))
 
+    if external_id and EXTERNAL_ID_PATTERN.fullmatch(external_id):
+        seen_external_ids.add(normalized_external_id)
+
     if errors:
         return None, errors
 
-    seen_external_ids.add(normalized_external_id)
     return {
+        "row_number": row_number,
+        "raw_row": raw_row,
         "external_id": normalized_external_id,
         "name": name,
         "amount": amount,

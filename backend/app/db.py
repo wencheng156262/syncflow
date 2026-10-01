@@ -251,14 +251,68 @@ def list_job_errors(
         connection.close()
 
 
-def write_job_result(
+def clear_job_result(job_id: str) -> None:
+    with transaction() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("DELETE FROM sync_records WHERE job_id = %s", (job_id,))
+            cursor.execute("DELETE FROM sync_errors WHERE job_id = %s", (job_id,))
+
+def insert_records_batch(job_id: str, records: Sequence[Dict[str, Any]]) -> None:
+    if not records:
+        return
+    with transaction() as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO sync_records
+                    (job_id, external_id, name, amount, record_date)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                [
+                    (
+                        job_id,
+                        record["external_id"],
+                        record["name"],
+                        record["amount"],
+                        record["record_date"],
+                    )
+                    for record in records
+                ],
+            )
+
+
+def insert_errors_batch(job_id: str, errors: Sequence[Dict[str, Any]]) -> None:
+    if not errors:
+        return
+    with transaction() as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO sync_errors
+                    (job_id, `row_number`, field_name, error_code,
+                     error_message, raw_row)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                [
+                    (
+                        job_id,
+                        error.get("row_number"),
+                        error.get("field_name"),
+                        error["error_code"],
+                        error["error_message"],
+                        json.dumps(error.get("raw_row"), ensure_ascii=False) if error.get("raw_row") is not None else None,
+                    )
+                    for error in errors
+                ],
+            )
+
+
+def finalize_job_result(
     job_id: str,
     total_records: int,
     success_records: int,
     failed_records: int,
-    records: Sequence[Dict[str, Any]],
-    errors: Sequence[Dict[str, Any]],
-    batch_size: int = 500,
+    last_error: Optional[Dict[str, Any]] = None,
 ) -> None:
     if failed_records == 0:
         final_status = "SUCCESS"
@@ -269,52 +323,6 @@ def write_job_result(
 
     with transaction() as connection:
         with connection.cursor() as cursor:
-            cursor.execute("DELETE FROM sync_records WHERE job_id = %s", (job_id,))
-            cursor.execute("DELETE FROM sync_errors WHERE job_id = %s", (job_id,))
-
-            for start in range(0, len(records), batch_size):
-                batch = records[start : start + batch_size]
-                cursor.executemany(
-                    """
-                    INSERT INTO sync_records
-                        (job_id, external_id, name, amount, record_date)
-                    VALUES (%s, %s, %s, %s, %s)
-                    """,
-                    [
-                        (
-                            job_id,
-                            record["external_id"],
-                            record["name"],
-                            record["amount"],
-                            record["record_date"],
-                        )
-                        for record in batch
-                    ],
-                )
-
-            for start in range(0, len(errors), batch_size):
-                batch = errors[start : start + batch_size]
-                cursor.executemany(
-                    """
-                    INSERT INTO sync_errors
-                        (job_id, `row_number`, field_name, error_code,
-                         error_message, raw_row)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    """,
-                    [
-                        (
-                            job_id,
-                            error.get("row_number"),
-                            error.get("field_name"),
-                            error["error_code"],
-                            error["error_message"],
-                            json.dumps(error.get("raw_row"), ensure_ascii=False) if error.get("raw_row") is not None else None,
-                        )
-                        for error in batch
-                    ],
-                )
-
-            last_error = errors[0] if errors else None
             cursor.execute(
                 """
                 UPDATE sync_jobs
