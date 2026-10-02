@@ -45,6 +45,7 @@ services:
       QUEUE_NAME: ${QUEUE_NAME:-syncflow:jobs}
       UPLOAD_DIR: /data/uploads
       MAX_UPLOAD_FILE_SIZE_MB: ${MAX_UPLOAD_FILE_SIZE_MB:-10}
+      MAX_RECORDS_PER_JOB: ${MAX_RECORDS_PER_JOB:-10000}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
     ports:
       - "8000:8000"
@@ -73,6 +74,7 @@ services:
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:-syncflow123}
       REDIS_ADDR: redis:6379
       QUEUE_NAME: ${QUEUE_NAME:-syncflow:jobs}
+      MAX_RECORDS_PER_JOB: ${MAX_RECORDS_PER_JOB:-10000}
     volumes:
       - ./data/uploads:/data/uploads
     depends_on:

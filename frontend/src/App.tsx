@@ -9,11 +9,13 @@ import {
   useNavigate,
   useParams,
 } from 'react-router-dom'
-import { ApiRequestError, createJob, getJob, healthCheck, listJobs } from './api'
-import type { Job, JobStatus } from './api'
+import { ApiRequestError, createJob, getJob, getJobErrors, healthCheck, listJobs } from './api'
+import type { Job, JobError, JobStatus } from './api'
 import './App.css'
 
 const PAGE_SIZE = 10
+const MAX_UPLOAD_FILE_SIZE = 10 * 1024 * 1024
+const TERMINAL_STATUSES = new Set<JobStatus>(['SUCCESS', 'PARTIAL_SUCCESS', 'FAILED', 'CANCELED'])
 
 const statusLabels: Record<JobStatus, string> = {
   PENDING: '等待中',
@@ -62,6 +64,7 @@ function Layout() {
           <Route path="/" element={<JobsPage />} />
           <Route path="/jobs/new" element={<CreateJobPage />} />
           <Route path="/jobs/:jobId" element={<JobDetailPage />} />
+          <Route path="/jobs/:jobId/errors" element={<JobErrorsPage />} />
           <Route path="*" element={<NotFoundPage />} />
         </Routes>
       </main>
@@ -191,6 +194,10 @@ function CreateJobPage() {
       setError('只支持 CSV 文件。')
       return
     }
+    if (file.size > MAX_UPLOAD_FILE_SIZE) {
+      setError('文件不能超过 10 MB。')
+      return
+    }
     setLoading(true)
     setError('')
     try {
@@ -213,6 +220,7 @@ function CreateJobPage() {
         <input id="job-name" value={name} onChange={(event) => setName(event.target.value)} maxLength={128} placeholder="例如：商品导入 2026-01-01" />
         <label htmlFor="job-file">CSV 文件</label>
         <input id="job-file" type="file" accept=".csv,text/csv" onChange={(event) => setFile(event.target.files?.[0] ?? null)} />
+        {file && <p className="file-summary">已选择：{file.name}（{(file.size / 1024).toFixed(1)} KB）</p>}
         <p className="form-hint">文件提交后进入 Redis 队列，由 Worker 异步处理。</p>
         {error && <ErrorBanner message={error} />}
         <button className="primary-button" type="submit" disabled={loading}>{loading ? '提交中...' : '提交任务'}</button>
@@ -227,8 +235,8 @@ function JobDetailPage() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
 
-  const loadJob = useCallback(async () => {
-    setLoading(true)
+  const loadJob = useCallback(async (showLoading = true) => {
+    if (showLoading) setLoading(true)
     setError('')
     try {
       const response = await getJob(jobId)
@@ -245,6 +253,12 @@ function JobDetailPage() {
     // oxlint-disable-next-line react/set-state-in-effect
     void loadJob()
   }, [loadJob])
+
+  useEffect(() => {
+    if (!job || TERMINAL_STATUSES.has(job.status)) return undefined
+    const timer = window.setInterval(() => void loadJob(false), 3000)
+    return () => window.clearInterval(timer)
+  }, [job, loadJob])
 
   return (
     <section className="narrow-page">
@@ -266,10 +280,77 @@ function JobDetailPage() {
               <DetailItem label="重试次数" value={String(job.retry_count)} />
             </div>
             {job.last_error_message && <div className="last-error"><strong>{job.last_error_code ?? '处理错误'}</strong><span>{job.last_error_message}</span></div>}
+            {(job.failed_records > 0 || job.last_error_code !== null) && <Link className="secondary-button error-link" to={`/jobs/${job.id}/errors`}>查看错误明细</Link>}
           </div>
           <button className="secondary-button refresh-detail" type="button" onClick={() => void loadJob()}>刷新详情</button>
         </>
       ) : null}
+    </section>
+  )
+}
+
+function JobErrorsPage() {
+  const { jobId = '' } = useParams()
+  const [errors, setErrors] = useState<JobError[]>([])
+  const [page, setPage] = useState(1)
+  const [total, setTotal] = useState(0)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+
+  const loadErrors = useCallback(async () => {
+    setLoading(true)
+    setError('')
+    try {
+      const response = await getJobErrors(jobId, page, PAGE_SIZE)
+      setErrors(response.data)
+      setTotal(Number(response.meta.total ?? 0))
+    } catch (requestError) {
+      setError(getErrorMessage(requestError))
+    } finally {
+      setLoading(false)
+    }
+  }, [jobId, page])
+
+  useEffect(() => {
+    // The error list request is intentionally tied to the route and page.
+    // oxlint-disable-next-line react/set-state-in-effect
+    void loadErrors()
+  }, [loadErrors])
+
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
+
+  return (
+    <section className="narrow-page error-page">
+      <Link className="back-link" to={`/jobs/${jobId}`}>← 返回任务详情</Link>
+      <div className="page-heading compact-heading">
+        <div><p className="eyebrow">ERROR DETAILS</p><h1>错误明细</h1><p className="page-description">按行查看 CSV 校验失败原因。</p></div>
+      </div>
+      {error && <ErrorBanner message={error} />}
+      {loading ? <div className="loading-state">正在加载错误明细...</div> : errors.length === 0 ? (
+        <div className="empty-state compact-empty"><h2>暂无错误记录</h2><p>这个任务没有可展示的错误明细。</p></div>
+      ) : (
+        <>
+          <div className="error-table-card">
+            <div className="error-table error-table-head"><span>行号</span><span>字段</span><span>错误码</span><span>错误信息</span><span>原始行</span></div>
+            {errors.map((item, index) => (
+              <div className="error-table error-table-row" key={`${item.row_number ?? 'file'}-${item.error_code}-${index}`}>
+                <span>{item.row_number ?? '-'}</span>
+                <span>{item.field_name ?? '-'}</span>
+                <span><code>{item.error_code}</code></span>
+                <span>{item.error_message}</span>
+                <code>{item.raw_row ? JSON.stringify(item.raw_row) : '-'}</code>
+              </div>
+            ))}
+          </div>
+          <div className="pagination">
+            <span>第 {page} / {totalPages} 页，共 {total} 条</span>
+            <div>
+              <button className="secondary-button" type="button" disabled={page <= 1 || loading} onClick={() => setPage((current) => current - 1)}>上一页</button>
+              <button className="secondary-button" type="button" disabled={page >= totalPages || loading} onClick={() => setPage((current) => current + 1)}>下一页</button>
+            </div>
+          </div>
+        </>
+      )}
     </section>
   )
 }

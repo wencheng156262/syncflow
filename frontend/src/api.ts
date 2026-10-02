@@ -22,6 +22,16 @@ export interface Job {
   finished_at: string | null
 }
 
+export interface JobError {
+  job_id: string
+  row_number: number | null
+  field_name: string | null
+  error_code: string
+  error_message: string
+  raw_row: Record<string, unknown> | { values: string[] } | null
+  created_at: string
+}
+
 export interface ApiErrorPayload {
   code: string
   message: string
@@ -86,6 +96,11 @@ export function listJobs(page: number, pageSize: number, status?: JobStatus | ''
 
 export function getJob(jobId: string) {
   return request<Job>(`/api/v1/jobs/${encodeURIComponent(jobId)}`)
+}
+
+export function getJobErrors(jobId: string, page: number, pageSize: number) {
+  const params = new URLSearchParams({ page: String(page), page_size: String(pageSize) })
+  return request<JobError[]>(`/api/v1/jobs/${encodeURIComponent(jobId)}/errors?${params.toString()}`)
 }
 
 export function createJob(file: File, name?: string) {

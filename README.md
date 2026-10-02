@@ -54,6 +54,12 @@ curl 'http://localhost:8000/api/v1/jobs?page=1&page_size=20'
 
 ```bash
 curl -F 'file=@./sample.csv' -F 'name=示例导入' http://localhost:8000/api/v1/jobs
+
+# Week 3 样例
+curl -F 'file=@./docs/examples/valid.csv' \
+  -F 'name=正常样例' \
+  http://localhost:8000/api/v1/jobs
+curl 'http://localhost:8000/api/v1/jobs/{job_id}/errors?page=1&page_size=20'
 ```
 
 ## 目录说明
@@ -62,7 +68,7 @@ curl -F 'file=@./sample.csv' -F 'name=示例导入' http://localhost:8000/api/v1
 - `backend/worker/`：Redis 消费和任务状态更新
 - `backend/migrations/`：可重复执行的 MySQL 初始化脚本
 - `frontend/src/`：React Web 页面
-- `docs/`：Week 1 规范设计包和 Week 2 实现记录
+- `docs/`：Week 1 规范设计包、Week 2/Week 3 实现记录和样例数据
 - `data/uploads/`：本地受控上传目录，不提交到仓库
 
 ## 开发检查
