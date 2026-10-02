@@ -11,4 +11,5 @@
 - `07-system-boundary.md`：系统边界图和核心流程图
 - `08-week2-implementation.md`：Week 2 任务管理链路实现记录
 - `09-week3-implementation.md`：Week 3 CSV 解析、校验、落库和错误明细实现记录
+- `10-week4-implementation.md`：Week 4 Worker 并发、重试、取消、超时和恢复实现记录
 - `08-week2-implementation.md`：Week 2 实现范围、文件职责和验收方式

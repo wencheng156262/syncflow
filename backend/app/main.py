@@ -23,7 +23,9 @@ from app.db import (
     list_job_errors,
     list_jobs as db_list_jobs,
     mark_job_failed,
+    request_job_cancel,
 )
+from app.state_machine import ALL_STATUSES, TERMINAL_STATUSES
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("syncflow.api")
@@ -41,7 +43,7 @@ REDIS_PORT = int(REDIS_PORT)
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "./data/uploads"))
 MAX_UPLOAD_FILE_SIZE_MB = int(os.getenv("MAX_UPLOAD_FILE_SIZE_MB", "10"))
 MAX_UPLOAD_FILE_SIZE = MAX_UPLOAD_FILE_SIZE_MB * 1024 * 1024
-ALLOWED_STATUSES = {"PENDING", "RUNNING", "SUCCESS", "PARTIAL_SUCCESS", "FAILED", "CANCELED"}
+ALLOWED_STATUSES = ALL_STATUSES
 
 redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 
@@ -231,6 +233,13 @@ def get_job_or_error(job_id: str) -> Dict[str, Any]:
     return job
 
 
+def enqueue_job(job_id: str, attempt_no: int = 0) -> None:
+    redis_client.lpush(
+        QUEUE_NAME,
+        json.dumps({"job_id": job_id, "attempt_no": attempt_no}, ensure_ascii=False),
+    )
+
+
 @app.get("/", response_model=ApiResponse[Dict[str, str]], tags=["system"])
 def root():
     return {"data": {"service": "SyncFlow API", "status": "running"}, "meta": {}}
@@ -297,12 +306,35 @@ def create_job(
         api_error(500, "INTERNAL_ERROR", "任务创建失败")
 
     try:
-        redis_client.lpush(QUEUE_NAME, job_id)
+        enqueue_job(job_id)
     except Exception:
         mark_job_failed(job_id, "QUEUE_UNAVAILABLE", "任务队列暂不可用")
         api_error(503, "QUEUE_UNAVAILABLE", "任务队列暂不可用")
 
     return {"data": serialize_job(get_job_or_error(job_id)), "meta": {}}
+
+
+@app.post(
+    "/api/v1/jobs/{job_id}/cancel",
+    status_code=202,
+    response_model=ApiResponse[JobResponse],
+    tags=["jobs"],
+)
+def cancel_job(job_id: str):
+    get_job_or_error(job_id)
+    previous_status = request_job_cancel(job_id)
+    if previous_status is None:
+        api_error(404, "JOB_NOT_FOUND", "任务不存在")
+    if previous_status in TERMINAL_STATUSES:
+        logger.warning("Invalid cancellation request job_id=%s status=%s", job_id, previous_status)
+        api_error(409, "INVALID_STATE_TRANSITION", "终态任务不能取消")
+    if previous_status not in {"PENDING", "RUNNING", "RETRYING", "CANCELING"}:
+        logger.warning("Invalid cancellation request job_id=%s status=%s", job_id, previous_status)
+        api_error(409, "INVALID_STATE_TRANSITION", "当前任务状态不支持取消")
+    return {
+        "data": serialize_job(get_job_or_error(job_id)),
+        "meta": {"previous_status": previous_status},
+    }
 
 
 @app.get("/api/v1/jobs/{job_id}", response_model=ApiResponse[JobResponse], tags=["jobs"])
