@@ -68,7 +68,7 @@ curl 'http://localhost:8000/api/v1/jobs/{job_id}/errors?page=1&page_size=20'
 - `backend/worker/`：Redis 消费和任务状态更新
 - `backend/migrations/`：可重复执行的 MySQL 初始化脚本
 - `frontend/src/`：React Web 页面
-- `docs/`：Week 1 规范设计包、Week 2/Week 3 实现记录和样例数据
+- `docs/`：Week 1 规范设计包、Week 2/Week 3/Week 4 实现记录和样例数据
 - `data/uploads/`：本地受控上传目录，不提交到仓库
 
 ## 开发检查
@@ -93,3 +93,5 @@ python -m venv .venv
 .venv/bin/python3 -m pip install -r requirements-dev.txt
 .venv/bin/python3 -m pytest -q
 ```
+
+Week 4 Worker 配置：`WORKER_CONCURRENCY`、`JOB_TIMEOUT_SECONDS`、`WORKER_SHUTDOWN_TIMEOUT_SECONDS` 和 `MAX_JOB_RETRIES`，详见 [Week 4 实现记录](docs/10-week4-implementation.md)。

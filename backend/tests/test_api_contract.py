@@ -79,3 +79,7 @@ def test_job_errors_returns_paginated_error_details(monkeypatch):
 
 def test_openapi_exposes_week3_error_endpoint():
     assert "/api/v1/jobs/{job_id}/errors" in app.openapi()["paths"]
+
+
+def test_openapi_exposes_week4_cancel_endpoint():
+    assert "/api/v1/jobs/{job_id}/cancel" in app.openapi()["paths"]

@@ -1,9 +1,11 @@
 export type JobStatus =
   | 'PENDING'
   | 'RUNNING'
+  | 'RETRYING'
   | 'SUCCESS'
   | 'PARTIAL_SUCCESS'
   | 'FAILED'
+  | 'CANCELING'
   | 'CANCELED'
 
 export interface Job {
@@ -96,6 +98,10 @@ export function listJobs(page: number, pageSize: number, status?: JobStatus | ''
 
 export function getJob(jobId: string) {
   return request<Job>(`/api/v1/jobs/${encodeURIComponent(jobId)}`)
+}
+
+export function cancelJob(jobId: string) {
+  return request<Job>(`/api/v1/jobs/${encodeURIComponent(jobId)}/cancel`, { method: 'POST' })
 }
 
 export function getJobErrors(jobId: string, page: number, pageSize: number) {

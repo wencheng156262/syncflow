@@ -11,6 +11,7 @@ Base URL：`/api/v1`。成功响应统一为 `{ "data": ..., "meta": ... }`，�
 | POST | `/api/v1/jobs` | 创建同步任务 | 201 |
 | GET | `/api/v1/jobs` | 分页查询任务 | 200 |
 | GET | `/api/v1/jobs/{job_id}` | 查询任务详情 | 200 |
+| POST | `/api/v1/jobs/{job_id}/cancel` | 请求取消任务 | 202 |
 
 ## 创建任务
 
@@ -38,6 +39,10 @@ Base URL：`/api/v1`。成功响应统一为 `{ "data": ..., "meta": ... }`，�
 ```
 
 创建接口只负责接收、保存和入队，不等待 CSV 全部处理完成。
+
+## 取消任务
+
+`POST /api/v1/jobs/{job_id}/cancel` 不会强制杀死 Worker：`PENDING`/`RETRYING` 直接进入 `CANCELED`，`RUNNING` 先进入 `CANCELING`，由 Worker 在批次边界安全停止。终态任务取消返回 409 `INVALID_STATE_TRANSITION`。
 
 ## 查询详情
 

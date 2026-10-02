@@ -9,7 +9,7 @@ import {
   useNavigate,
   useParams,
 } from 'react-router-dom'
-import { ApiRequestError, createJob, getJob, getJobErrors, healthCheck, listJobs } from './api'
+import { ApiRequestError, cancelJob, createJob, getJob, getJobErrors, healthCheck, listJobs } from './api'
 import type { Job, JobError, JobStatus } from './api'
 import './App.css'
 
@@ -20,9 +20,11 @@ const TERMINAL_STATUSES = new Set<JobStatus>(['SUCCESS', 'PARTIAL_SUCCESS', 'FAI
 const statusLabels: Record<JobStatus, string> = {
   PENDING: '等待中',
   RUNNING: '处理中',
+  RETRYING: '重试中',
   SUCCESS: '已完成',
   PARTIAL_SUCCESS: '部分成功',
   FAILED: '失败',
+  CANCELING: '取消中',
   CANCELED: '已取消',
 }
 
@@ -106,7 +108,7 @@ function JobsPage() {
   }, [loadJobs])
 
   const processingCount = useMemo(
-    () => jobs.filter((job) => job.status === 'PENDING' || job.status === 'RUNNING').length,
+    () => jobs.filter((job) => !TERMINAL_STATUSES.has(job.status)).length,
     [jobs],
   )
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
@@ -234,6 +236,7 @@ function JobDetailPage() {
   const [job, setJob] = useState<Job | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [canceling, setCanceling] = useState(false)
 
   const loadJob = useCallback(async (showLoading = true) => {
     if (showLoading) setLoading(true)
@@ -247,6 +250,19 @@ function JobDetailPage() {
       setLoading(false)
     }
   }, [jobId])
+
+  async function requestCancel() {
+    setCanceling(true)
+    setError('')
+    try {
+      const response = await cancelJob(jobId)
+      setJob(response.data)
+    } catch (requestError) {
+      setError(getErrorMessage(requestError))
+    } finally {
+      setCanceling(false)
+    }
+  }
 
   useEffect(() => {
     // The detail request is intentionally started when the route parameter changes.
@@ -281,6 +297,7 @@ function JobDetailPage() {
             </div>
             {job.last_error_message && <div className="last-error"><strong>{job.last_error_code ?? '处理错误'}</strong><span>{job.last_error_message}</span></div>}
             {(job.failed_records > 0 || job.last_error_code !== null) && <Link className="secondary-button error-link" to={`/jobs/${job.id}/errors`}>查看错误明细</Link>}
+            {!TERMINAL_STATUSES.has(job.status) && <button className="secondary-button cancel-button" type="button" onClick={() => void requestCancel()} disabled={canceling || job.status === 'CANCELING'}>{canceling || job.status === 'CANCELING' ? '取消中...' : '取消任务'}</button>}
           </div>
           <button className="secondary-button refresh-detail" type="button" onClick={() => void loadJob()}>刷新详情</button>
         </>

@@ -26,6 +26,7 @@ JOB_COLUMNS = """
     started_at, finished_at
 """
 PROCESSING_JOB_COLUMNS = JOB_COLUMNS + ", stored_file_path"
+NON_TERMINAL_STATUSES = ("PENDING", "RUNNING", "RETRYING", "CANCELING")
 
 
 def get_db_connection():
@@ -192,18 +193,152 @@ def update_job_status(job_id: str, status: str) -> int:
         connection.close()
 
 
-def mark_job_failed(job_id: str, error_code: str, message: str) -> None:
+def get_job_status(job_id: str) -> Optional[Dict[str, Any]]:
+    connection = get_db_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT id, status, retry_count FROM sync_jobs WHERE id = %s",
+                (job_id,),
+            )
+            return cursor.fetchone()
+    finally:
+        connection.close()
+
+
+def transition_job(
+    job_id: str,
+    from_statuses: Sequence[str],
+    to_status: str,
+    error_code: Optional[str] = None,
+    error_message: Optional[str] = None,
+    increment_retry: bool = False,
+) -> bool:
+    if not from_statuses:
+        return False
+
+    placeholders = ", ".join(["%s"] * len(from_statuses))
+    assignments = ["status = %s", "updated_at = UTC_TIMESTAMP(3)"]
+    params: List[Any] = [to_status]
+    if to_status == "RUNNING":
+        assignments.append("started_at = COALESCE(started_at, UTC_TIMESTAMP(3))")
+    if to_status in {"SUCCESS", "PARTIAL_SUCCESS", "FAILED", "CANCELED"}:
+        assignments.append("finished_at = UTC_TIMESTAMP(3)")
+    if error_code is not None:
+        assignments.append("last_error_code = %s")
+        params.append(error_code)
+    if error_message is not None:
+        assignments.append("last_error_message = %s")
+        params.append(error_message)
+    if increment_retry:
+        assignments.append("retry_count = retry_count + 1")
+
+    params.extend([job_id, *from_statuses])
     with transaction() as connection:
         with connection.cursor() as cursor:
             cursor.execute(
-                """
+                f"""
                 UPDATE sync_jobs
-                SET status = 'FAILED', last_error_code = %s,
-                    last_error_message = %s, finished_at = UTC_TIMESTAMP(3)
-                WHERE id = %s
+                SET {", ".join(assignments)}
+                WHERE id = %s AND status IN ({placeholders})
                 """,
-                (error_code, message, job_id),
+                params,
             )
+            return cursor.rowcount == 1
+
+
+def request_job_cancel(job_id: str) -> Optional[str]:
+    with transaction() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT status FROM sync_jobs WHERE id = %s FOR UPDATE",
+                (job_id,),
+            )
+            job = cursor.fetchone()
+            if job is None:
+                return None
+
+            current_status = job["status"]
+            if current_status in {"PENDING", "RETRYING"}:
+                cursor.execute(
+                    """
+                    UPDATE sync_jobs
+                    SET status = 'CANCELED',
+                        last_error_code = 'CANCELED_BY_USER',
+                        last_error_message = '任务已被用户取消',
+                        finished_at = UTC_TIMESTAMP(3),
+                        updated_at = UTC_TIMESTAMP(3)
+                    WHERE id = %s
+                    """,
+                    (job_id,),
+                )
+            elif current_status == "RUNNING":
+                cursor.execute(
+                    """
+                    UPDATE sync_jobs
+                    SET status = 'CANCELING',
+                        last_error_code = 'CANCEL_REQUESTED',
+                        last_error_message = '已请求取消，等待 Worker 安全停止',
+                        updated_at = UTC_TIMESTAMP(3)
+                    WHERE id = %s AND status = 'RUNNING'
+                    """,
+                    (job_id,),
+                )
+            return current_status
+
+
+def mark_job_pending(job_id: str) -> bool:
+    return transition_job(job_id, ("RETRYING",), "PENDING")
+
+
+def mark_job_retrying(job_id: str, error_code: str, message: str) -> bool:
+    return transition_job(
+        job_id,
+        ("RUNNING",),
+        "RETRYING",
+        error_code=error_code,
+        error_message=message,
+        increment_retry=True,
+    )
+
+
+def mark_job_canceled(job_id: str) -> bool:
+    return transition_job(
+        job_id,
+        ("CANCELING",),
+        "CANCELED",
+        error_code="CANCELED_BY_USER",
+        error_message="任务已被用户取消",
+    )
+
+
+def list_stale_running_jobs(timeout_seconds: int) -> List[Dict[str, Any]]:
+    connection = get_db_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, retry_count
+                FROM sync_jobs
+                WHERE status = 'RUNNING'
+                  AND updated_at < UTC_TIMESTAMP(3) - INTERVAL %s SECOND
+                ORDER BY updated_at ASC
+                """,
+                (timeout_seconds,),
+            )
+            return cursor.fetchall()
+    finally:
+        connection.close()
+
+
+def mark_job_failed(job_id: str, error_code: str, message: str) -> None:
+    transition_job(
+        job_id,
+        NON_TERMINAL_STATUSES,
+        "FAILED",
+        error_code=error_code,
+        error_message=message,
+    )
 
 
 def mark_job_running(job_id: str) -> bool:
@@ -313,7 +448,7 @@ def finalize_job_result(
     success_records: int,
     failed_records: int,
     last_error: Optional[Dict[str, Any]] = None,
-) -> None:
+) -> bool:
     if failed_records == 0:
         final_status = "SUCCESS"
     elif success_records > 0:
@@ -345,6 +480,7 @@ def finalize_job_result(
                     job_id,
                 ),
             )
+            return cursor.rowcount == 1
 
 
 def write_file_error(job_id: str, error_code: str, error_message: str) -> None:
