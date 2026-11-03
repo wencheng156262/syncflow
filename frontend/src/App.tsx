@@ -1,5 +1,5 @@
 /* oxlint-disable react/set-state-in-effect -- API loading effects update view state by design. */
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   BrowserRouter,
   Link,
@@ -9,7 +9,7 @@ import {
   useNavigate,
   useParams,
 } from 'react-router-dom'
-import { ApiRequestError, cancelJob, createJob, getJob, getJobErrors, healthCheck, listJobs } from './api'
+import { ApiRequestError, cancelJob, createJob, getJob, getJobErrors, healthCheck, listJobs, retryJob } from './api'
 import type { Job, JobError, JobStatus } from './api'
 import './App.css'
 
@@ -43,7 +43,12 @@ function ErrorBanner({ message }: { message: string }) {
 }
 
 function getErrorMessage(error: unknown) {
-  if (error instanceof ApiRequestError) return error.message
+  if (error instanceof ApiRequestError) {
+    if (error.code === 'IDEMPOTENCY_KEY_CONFLICT') return '同一个幂等键对应了不同文件，请重新选择文件后再提交。'
+    if (error.code === 'JOB_NOT_RETRYABLE') return '只有失败任务可以重新执行。'
+    if (error.code === 'JOB_NOT_CANCELABLE') return '当前任务状态不允许取消。'
+    return error.message
+  }
   return '请求失败，请稍后重试。'
 }
 
@@ -185,6 +190,7 @@ function CreateJobPage() {
   const [file, setFile] = useState<File | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  const idempotencyKey = useRef(crypto.randomUUID())
 
   async function submit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -203,7 +209,7 @@ function CreateJobPage() {
     setLoading(true)
     setError('')
     try {
-      const response = await createJob(file, name)
+      const response = await createJob(file, name, idempotencyKey.current)
       navigate(`/jobs/${response.data.id}`)
     } catch (requestError) {
       setError(getErrorMessage(requestError))
@@ -221,7 +227,7 @@ function CreateJobPage() {
         <label htmlFor="job-name">任务名称（可选）</label>
         <input id="job-name" value={name} onChange={(event) => setName(event.target.value)} maxLength={128} placeholder="例如：商品导入 2026-01-01" />
         <label htmlFor="job-file">CSV 文件</label>
-        <input id="job-file" type="file" accept=".csv,text/csv" onChange={(event) => setFile(event.target.files?.[0] ?? null)} />
+        <input id="job-file" type="file" accept=".csv,text/csv" onChange={(event) => { idempotencyKey.current = crypto.randomUUID(); setFile(event.target.files?.[0] ?? null) }} />
         {file && <p className="file-summary">已选择：{file.name}（{(file.size / 1024).toFixed(1)} KB）</p>}
         <p className="form-hint">文件提交后进入 Redis 队列，由 Worker 异步处理。</p>
         {error && <ErrorBanner message={error} />}
@@ -237,6 +243,7 @@ function JobDetailPage() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [canceling, setCanceling] = useState(false)
+  const [retrying, setRetrying] = useState(false)
 
   const loadJob = useCallback(async (showLoading = true) => {
     if (showLoading) setLoading(true)
@@ -252,6 +259,8 @@ function JobDetailPage() {
   }, [jobId])
 
   async function requestCancel() {
+    // Ask for confirmation because cancellation changes a running task's state.
+    if (!window.confirm('确定取消这个任务吗？')) return
     setCanceling(true)
     setError('')
     try {
@@ -261,6 +270,21 @@ function JobDetailPage() {
       setError(getErrorMessage(requestError))
     } finally {
       setCanceling(false)
+    }
+  }
+
+  async function requestRetry() {
+    // Ask for confirmation before clearing the failed round's result records.
+    if (!window.confirm('确定重新执行这个失败任务吗？')) return
+    setRetrying(true)
+    setError('')
+    try {
+      const response = await retryJob(jobId)
+      setJob(response.data)
+    } catch (requestError) {
+      setError(getErrorMessage(requestError))
+    } finally {
+      setRetrying(false)
     }
   }
 
@@ -293,11 +317,12 @@ function JobDetailPage() {
               <DetailItem label="总记录数" value={String(job.total_records)} />
               <DetailItem label="成功记录数" value={String(job.success_records)} />
               <DetailItem label="失败记录数" value={String(job.failed_records)} />
-              <DetailItem label="重试次数" value={String(job.retry_count)} />
+              <DetailItem label="重试次数" value={`${job.retry_count} / ${job.max_attempts}`} />
             </div>
             {job.last_error_message && <div className="last-error"><strong>{job.last_error_code ?? '处理错误'}</strong><span>{job.last_error_message}</span></div>}
             {(job.failed_records > 0 || job.last_error_code !== null) && <Link className="secondary-button error-link" to={`/jobs/${job.id}/errors`}>查看错误明细</Link>}
             {!TERMINAL_STATUSES.has(job.status) && <button className="secondary-button cancel-button" type="button" onClick={() => void requestCancel()} disabled={canceling || job.status === 'CANCELING'}>{canceling || job.status === 'CANCELING' ? '取消中...' : '取消任务'}</button>}
+            {job.status === 'FAILED' && <button className="secondary-button retry-button" type="button" onClick={() => void requestRetry()} disabled={retrying}>{retrying ? '重新执行中...' : '重新执行'}</button>}
           </div>
           <button className="secondary-button refresh-detail" type="button" onClick={() => void loadJob()}>刷新详情</button>
         </>

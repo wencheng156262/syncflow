@@ -42,9 +42,9 @@ def test_cancel_endpoint_rejects_terminal_job(monkeypatch):
     response = client.post("/api/v1/jobs/job-1/cancel")
 
     assert response.status_code == 409
-    assert response.json()["error"]["code"] == "INVALID_STATE_TRANSITION"
+    assert response.json()["error"]["code"] == "JOB_NOT_CANCELABLE"
 
 
 def test_worker_accepts_json_and_legacy_queue_messages():
     assert parse_queue_message('{"job_id":"job-1","attempt_no":2}') == ("job-1", 2)
-    assert parse_queue_message("job-2") == ("job-2", 0)
+    assert parse_queue_message("job-2") == ("job-2", 1)

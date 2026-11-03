@@ -17,6 +17,7 @@ from app.db import (
     finalize_job_result,
     get_job_for_processing,
     get_job_status,
+    finish_job_attempt,
     insert_errors_batch,
     insert_records_batch,
     list_stale_running_jobs,
@@ -25,8 +26,10 @@ from app.db import (
     mark_job_pending,
     mark_job_retrying,
     mark_job_running,
+    start_job_attempt,
     write_file_error,
 )
+from app.retry_policy import backoff_seconds, is_retryable_error, parse_backoff_schedule
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("syncflow.worker")
@@ -36,7 +39,8 @@ REDIS_HOST, REDIS_PORT = os.getenv("REDIS_ADDR", "localhost:6379").rsplit(":", 1
 REDIS_PORT = int(REDIS_PORT)
 MAX_RECORDS_PER_JOB = int(os.getenv("MAX_RECORDS_PER_JOB", "10000"))
 BATCH_SIZE = 500
-MAX_JOB_RETRIES = int(os.getenv("MAX_JOB_RETRIES", "2"))
+MAX_JOB_ATTEMPTS = max(int(os.getenv("MAX_JOB_ATTEMPTS", os.getenv("MAX_JOB_RETRIES", "3"))), 1)
+RETRY_BACKOFF_SECONDS = parse_backoff_schedule(os.getenv("RETRY_BACKOFF_SECONDS", "5,30,120"))
 JOB_TIMEOUT_SECONDS = int(os.getenv("JOB_TIMEOUT_SECONDS", "300"))
 WORKER_SHUTDOWN_TIMEOUT_SECONDS = int(os.getenv("WORKER_SHUTDOWN_TIMEOUT_SECONDS", "30"))
 DEFAULT_CONCURRENCY = min(max(os.cpu_count() or 2, 2), 4)
@@ -50,15 +54,29 @@ class JobControlError(Exception):
 
 
 class JobCanceled(JobControlError):
+    """Signal that a user cancellation should stop the current attempt."""
+
     pass
 
 
 class JobTimedOut(JobControlError):
+    """Signal that the current attempt exceeded its execution deadline."""
+
     pass
 
 
 class WorkerShuttingDown(JobControlError):
+    """Signal that shutdown should return the job to the queue safely."""
+
     pass
+
+
+class RetryableProcessingError(Exception):
+    """Carry a stable error code for a transient processing failure."""
+
+    def __init__(self, error_code: str, message: str) -> None:
+        super().__init__(message)
+        self.error_code = error_code
 
 
 def parse_queue_message(raw_message: str) -> Tuple[str, int]:
@@ -67,10 +85,10 @@ def parse_queue_message(raw_message: str) -> Tuple[str, int]:
     try:
         payload = json.loads(raw_message)
     except json.JSONDecodeError:
-        return raw_message, 0
+        return raw_message, 1
     if isinstance(payload, dict) and payload.get("job_id"):
-        return str(payload["job_id"]), int(payload.get("attempt_no", 0))
-    return raw_message, 0
+        return str(payload["job_id"]), max(int(payload.get("attempt_no", 1)), 1)
+    return raw_message, 1
 
 
 def publish_job(job_id: str, attempt_no: int) -> None:
@@ -95,26 +113,36 @@ def _check_job_control(job_id: str, started_at: float, stop_event: threading.Eve
         raise JobControlError(f"任务当前状态为 {job['status']}")
 
 
-def _schedule_retry(job_id: str, error_code: str, message: str) -> None:
+def _schedule_retry(job_id: str, attempt_no: int, error_code: str, message: str) -> None:
+    """Retry transient failures with backoff, or finish the job as FAILED."""
     current = get_job_status(job_id)
     if current is None or current["status"] != "RUNNING":
         return
 
-    if int(current["retry_count"] or 0) >= MAX_JOB_RETRIES:
+    retryable = is_retryable_error(error_code)
+    if not retryable or attempt_no >= MAX_JOB_ATTEMPTS:
         mark_job_failed(job_id, error_code, message)
-        logger.error("job_id=%s retry_limit_reached status=FAILED", job_id)
+        finish_job_attempt(job_id, attempt_no, "FAILED", error_code, message)
+        logger.error("job_id=%s status=FAILED retryable=%s attempt=%s", job_id, retryable, attempt_no)
         return
 
     if not mark_job_retrying(job_id, error_code, message):
         return
 
+    finish_job_attempt(job_id, attempt_no, "RETRYING", error_code, message)
+    delay = backoff_seconds(attempt_no, RETRY_BACKOFF_SECONDS)
+    logger.warning("job_id=%s status=RETRYING backoff=%ss next_attempt=%s", job_id, delay, attempt_no + 1)
+    if delay:
+        time.sleep(delay)
     retry_state = get_job_status(job_id)
-    attempt_no = int(retry_state["retry_count"] or 0) if retry_state else 0
+    if retry_state is None or retry_state["status"] != "RETRYING":
+        logger.info("job_id=%s retry canceled while waiting", job_id)
+        return
     if not mark_job_pending(job_id):
         logger.warning("job_id=%s could not transition RETRYING -> PENDING", job_id)
         return
     try:
-        publish_job(job_id, attempt_no)
+        publish_job(job_id, attempt_no + 1)
     except Exception:
         logger.exception("job_id=%s retry enqueue failed", job_id)
         mark_job_failed(job_id, "QUEUE_UNAVAILABLE", "重试任务重新入队失败")
@@ -129,10 +157,10 @@ def recover_stale_jobs() -> None:
     for job in list_stale_running_jobs(JOB_TIMEOUT_SECONDS):
         job_id = job["id"]
         logger.warning("job_id=%s stale RUNNING job detected; recovering", job_id)
-        _schedule_retry(job_id, "WORKER_RESTARTED", "Worker 重启后恢复超时任务")
+        _schedule_retry(job_id, max(int(job["retry_count"] or 0) + 1, 1), "WORKER_RESTARTED", "Worker 重启后恢复超时任务")
 
 
-def process_job(job_id: str, attempt_no: int = 0, stop_event: Optional[threading.Event] = None) -> None:
+def process_job(job_id: str, attempt_no: int = 1, stop_event: Optional[threading.Event] = None) -> None:
     stop_event = stop_event or threading.Event()
     job = get_job_for_processing(job_id)
     if job is None:
@@ -144,6 +172,8 @@ def process_job(job_id: str, attempt_no: int = 0, stop_event: Optional[threading
         return
 
     started_at = time.monotonic()
+    start_job_attempt(job_id, max(attempt_no, 1))
+    attempt_no = max(attempt_no, 1)
     logger.info("job_id=%s status=RUNNING attempt=%s", job_id, attempt_no)
 
     try:
@@ -154,6 +184,7 @@ def process_job(job_id: str, attempt_no: int = 0, stop_event: Optional[threading
         if parsed.file_error:
             error = parsed.file_error
             write_file_error(job_id, error["error_code"], error["error_message"])
+            finish_job_attempt(job_id, attempt_no, "FAILED", error["error_code"], error["error_message"])
             logger.error("job_id=%s file_error=%s", job_id, error["error_code"])
             return
 
@@ -167,29 +198,14 @@ def process_job(job_id: str, attempt_no: int = 0, stop_event: Optional[threading
             batch = parsed.records[start : start + BATCH_SIZE]
             try:
                 insert_records_batch(job_id, batch)
-            except Exception:
+            except Exception as exc:
                 logger.exception(
                     "job_id=%s record_batch_failed start=%s size=%s",
                     job_id,
                     start,
                     len(batch),
                 )
-                batch_errors = [
-                    {
-                        "row_number": record["row_number"],
-                        "field_name": None,
-                        "error_code": "BATCH_WRITE_FAILED",
-                        "error_message": "成功记录批量写入失败",
-                        "raw_row": record.get("raw_row"),
-                    }
-                    for record in batch
-                ]
-                failed_row_numbers.update(error["row_number"] for error in batch_errors)
-                all_errors.extend(batch_errors)
-                try:
-                    insert_errors_batch(job_id, batch_errors)
-                except Exception:
-                    logger.exception("job_id=%s batch error details could not be saved", job_id)
+                raise RetryableProcessingError("BATCH_WRITE_FAILED", f"成功记录批量写入失败：{exc}") from exc
             else:
                 success_records += len(batch)
 
@@ -207,13 +223,14 @@ def process_job(job_id: str, attempt_no: int = 0, stop_event: Optional[threading
             batch = parsed.errors[start : start + BATCH_SIZE]
             try:
                 insert_errors_batch(job_id, batch)
-            except Exception:
+            except Exception as exc:
                 logger.exception(
                     "job_id=%s error_batch_failed start=%s size=%s",
                     job_id,
                     start,
                     len(batch),
                 )
+                raise RetryableProcessingError("BATCH_WRITE_FAILED", f"错误记录批量写入失败：{exc}") from exc
 
         finalized = finalize_job_result(
             job_id=job_id,
@@ -224,9 +241,11 @@ def process_job(job_id: str, attempt_no: int = 0, stop_event: Optional[threading
         )
         if not finalized:
             if mark_job_canceled(job_id):
+                finish_job_attempt(job_id, attempt_no, "CANCELED", "JOB_CANCELED", "任务已被用户取消")
                 logger.info("job_id=%s status=CANCELED after concurrent cancel request", job_id)
             return
         final_status = "SUCCESS" if not failed_row_numbers else "PARTIAL_SUCCESS" if success_records else "FAILED"
+        finish_job_attempt(job_id, attempt_no, final_status)
         logger.info(
             "job_id=%s progress=%s/%s success=%s failed=%s status=%s",
             job_id,
@@ -238,15 +257,20 @@ def process_job(job_id: str, attempt_no: int = 0, stop_event: Optional[threading
         )
     except JobCanceled as exc:
         if mark_job_canceled(job_id):
+            finish_job_attempt(job_id, attempt_no, "CANCELED", "JOB_CANCELED", str(exc))
             logger.info("job_id=%s status=CANCELED reason=%s", job_id, exc)
     except (JobTimedOut, WorkerShuttingDown) as exc:
         code = "JOB_TIMEOUT" if isinstance(exc, JobTimedOut) else "WORKER_SHUTDOWN"
-        _schedule_retry(job_id, code, str(exc))
+        _schedule_retry(job_id, attempt_no, code, str(exc))
+    except RetryableProcessingError as exc:
+        _schedule_retry(job_id, attempt_no, exc.error_code, str(exc))
     except JobControlError as exc:
+        mark_job_failed(job_id, "JOB_CONTROL_ERROR", str(exc))
+        finish_job_attempt(job_id, attempt_no, "FAILED", "JOB_CONTROL_ERROR", str(exc))
         logger.warning("job_id=%s stopped without retry: %s", job_id, exc)
     except Exception as exc:
         logger.exception("job_id=%s failed during processing", job_id)
-        _schedule_retry(job_id, "PROCESSING_ERROR", f"处理任务时发生错误：{exc}")
+        _schedule_retry(job_id, attempt_no, "PROCESSING_ERROR", f"处理任务时发生错误：{exc}")
 
 
 def _install_signal_handlers(stop_event: threading.Event) -> None:
@@ -299,7 +323,7 @@ def main() -> None:
 
         for job_id, future in list(active.items()):
             if not future.done():
-                _schedule_retry(job_id, "WORKER_SHUTDOWN_TIMEOUT", "Worker 优雅停止超时，任务已重新入队")
+                _schedule_retry(job_id, 1, "WORKER_SHUTDOWN_TIMEOUT", "Worker 优雅停止超时，任务已重新入队")
 
         executor.shutdown(wait=True, cancel_futures=False)
         logger.info("Worker stopped")

@@ -17,6 +17,7 @@ export interface Job {
   success_records: number
   failed_records: number
   retry_count: number
+  max_attempts: number
   last_error_code: string | null
   last_error_message: string | null
   created_at: string
@@ -104,18 +105,24 @@ export function cancelJob(jobId: string) {
   return request<Job>(`/api/v1/jobs/${encodeURIComponent(jobId)}/cancel`, { method: 'POST' })
 }
 
+// Manually restart a FAILED job without creating a second job record.
+export function retryJob(jobId: string) {
+  return request<Job>(`/api/v1/jobs/${encodeURIComponent(jobId)}/retry`, { method: 'POST' })
+}
+
 export function getJobErrors(jobId: string, page: number, pageSize: number) {
   const params = new URLSearchParams({ page: String(page), page_size: String(pageSize) })
   return request<JobError[]>(`/api/v1/jobs/${encodeURIComponent(jobId)}/errors?${params.toString()}`)
 }
 
-export function createJob(file: File, name?: string) {
+// Reuse one idempotency key so a client-side request retry cannot duplicate a job.
+export function createJob(file: File, name?: string, idempotencyKey = crypto.randomUUID()) {
   const formData = new FormData()
   formData.append('file', file)
   if (name?.trim()) formData.append('name', name.trim())
   return request<Job>('/api/v1/jobs', {
     method: 'POST',
-    headers: { 'Idempotency-Key': crypto.randomUUID() },
+    headers: { 'Idempotency-Key': idempotencyKey },
     body: formData,
   })
 }
