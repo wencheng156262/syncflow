@@ -22,7 +22,7 @@ RETRYING   -> PENDING | FAILED | CANCELED
 CANCELING  -> CANCELED | FAILED
 ```
 
-终态默认不可再次转换。重试时由应用创建一次新的执行尝试，增加 `retry_count`，再按策略回到 `PENDING`；不得直接覆盖已完成的历史结果。
+终态默认不可再次转换。自动重试时由应用创建一次新的执行尝试，增加 `retry_count`，再按策略回到 `PENDING`；Week 5 的手动重试允许 `FAILED -> PENDING`，复用原任务但开始新的执行轮次。
 
 ## 状态与统计约束
 

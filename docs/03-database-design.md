@@ -12,7 +12,7 @@
 | `source_file_name` | `varchar(255)` | 原始文件名，仅用于展示 |
 | `stored_file_path` | `varchar(512)` | 受控存储路径，不通过 API 返回 |
 | `file_sha256` | `char(64)` | 文件摘要 |
-| `idempotency_key` | `varchar(128)` | 幂等键，可空且唯一 |
+| `idempotency_key` | `varchar(128)` | 幂等键，可空；24 小时窗口由专用表维护 |
 | `total_records` | `int unsigned` | 总记录数 |
 | `success_records` | `int unsigned` | 成功记录数 |
 | `failed_records` | `int unsigned` | 失败记录数 |
@@ -24,7 +24,7 @@
 | `finished_at` | `datetime(3)` | 完成时间，可空 |
 | `updated_at` | `datetime(3)` | 更新时间 |
 
-索引：主键 `id`，唯一索引 `idempotency_key`，列表查询索引 `(status, created_at)` 和 `(created_at)`。
+索引：主键 `id`，列表查询索引 `(status, created_at)` 和 `(created_at)`。
 
 ## `sync_records` 成功记录表
 
@@ -34,8 +34,16 @@
 
 字段包括自增主键 `id`、`job_id`、`row_number`、`field_name`、`error_code`、`error_message`、`raw_row JSON`、`created_at`。索引为 `(job_id, row_number)`，支持按任务分页查看错误明细。
 
+## `job_attempts` 执行尝试表
+
+每次 Worker 实际开始执行都写入一行。`attempt_no` 从 1 开始，唯一约束 `(job_id, attempt_no)` 防止同一轮重复记录；`RETRYING`、`SUCCESS`、`FAILED`、`CANCELED` 会写入结束状态和错误摘要。
+
+## `job_idempotency_keys` 幂等键窗口表
+
+以 `idempotency_key` 为主键，保存任务 ID、文件 SHA-256 和 `expires_at`。API 在 24 小时内比较文件摘要：相同文件返回原任务，不同文件返回 `IDEMPOTENCY_KEY_CONFLICT`；过期后允许同一个键重新使用。
+
 ## 迁移规则
 
 - 所有迁移使用 `CREATE TABLE IF NOT EXISTS`，允许重复执行。
-- 当前可执行脚本为 `backend/migrations/001_create_jobs.sql` 和 `002_create_sync_tables.sql`。
+- 当前可执行脚本为 `backend/migrations/001_create_jobs.sql`、`002_create_sync_tables.sql` 和 `003_week5_reliability.sql`。
 - 新业务代码使用 `sync_jobs`、`sync_records`、`sync_errors`；旧 `jobs` 表保留用于兼容已有本地数据，后续再单独清理。

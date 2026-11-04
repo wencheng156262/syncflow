@@ -18,11 +18,13 @@ from starlette.requests import Request
 from app.db import (
     get_db_connection,
     get_job,
-    get_job_by_idempotency_key,
     insert_job,
+    IdempotencyConflictError,
+    list_job_attempts,
     list_job_errors,
     list_jobs as db_list_jobs,
     mark_job_failed,
+    prepare_job_retry,
     request_job_cancel,
 )
 from app.state_machine import ALL_STATUSES, TERMINAL_STATUSES
@@ -37,6 +39,7 @@ app = FastAPI(
 )
 
 QUEUE_NAME = os.getenv("QUEUE_NAME", "syncflow:jobs")
+MAX_JOB_ATTEMPTS = max(int(os.getenv("MAX_JOB_ATTEMPTS", os.getenv("MAX_JOB_RETRIES", "3"))), 1)
 REDIS_ADDR = os.getenv("REDIS_ADDR", "localhost:6379")
 REDIS_HOST, REDIS_PORT = REDIS_ADDR.rsplit(":", 1)
 REDIS_PORT = int(REDIS_PORT)
@@ -69,6 +72,7 @@ class JobResponse(BaseModel):
     success_records: int
     failed_records: int
     retry_count: int
+    max_attempts: int
     last_error_code: Optional[str] = None
     last_error_message: Optional[str] = None
     created_at: str
@@ -84,6 +88,17 @@ class ErrorResponse(BaseModel):
     error_message: str
     raw_row: Any = None
     created_at: str
+
+
+class AttemptResponse(BaseModel):
+    id: int
+    job_id: str
+    attempt_no: int
+    status: str
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
 
 
 ResponseData = TypeVar("ResponseData")
@@ -167,6 +182,7 @@ def serialize_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "success_records": int(job["success_records"] or 0),
         "failed_records": int(job["failed_records"] or 0),
         "retry_count": int(job["retry_count"] or 0),
+        "max_attempts": int(job.get("max_attempts") or MAX_JOB_ATTEMPTS),
         "last_error_code": job["last_error_code"],
         "last_error_message": job["last_error_message"],
         "created_at": format_datetime(job["created_at"]),
@@ -190,6 +206,20 @@ def serialize_error(error: Dict[str, Any]) -> Dict[str, Any]:
         "error_message": error["error_message"],
         "raw_row": raw_row,
         "created_at": format_datetime(error["created_at"]),
+    }
+
+
+def serialize_attempt(attempt: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert an attempt database row into the public API representation."""
+    return {
+        "id": int(attempt["id"]),
+        "job_id": attempt["job_id"],
+        "attempt_no": int(attempt["attempt_no"]),
+        "status": attempt["status"],
+        "error_code": attempt.get("error_code"),
+        "error_message": attempt.get("error_message"),
+        "started_at": format_datetime(attempt.get("started_at")),
+        "finished_at": format_datetime(attempt.get("finished_at")),
     }
 
 
@@ -233,7 +263,8 @@ def get_job_or_error(job_id: str) -> Dict[str, Any]:
     return job
 
 
-def enqueue_job(job_id: str, attempt_no: int = 0) -> None:
+def enqueue_job(job_id: str, attempt_no: int = 1) -> None:
+    """Publish one job attempt to Redis, using one-based attempt numbers."""
     redis_client.lpush(
         QUEUE_NAME,
         json.dumps({"job_id": job_id, "attempt_no": attempt_no}, ensure_ascii=False),
@@ -272,20 +303,12 @@ def create_job(
     if not original_name.lower().endswith(".csv"):
         api_error(400, "INVALID_FILE_EXTENSION", "只支持 CSV 文件")
 
-    if idempotency_key:
-        existing = get_job_by_idempotency_key(idempotency_key)
-        if existing:
-            return {
-                "data": serialize_job(get_job_or_error(existing["id"])),
-                "meta": {"idempotent": True},
-            }
-
     source_file_name, stored_file_path, file_sha256 = save_upload(file)
     job_id = str(uuid.uuid4())
     job_name = (name or Path(source_file_name).stem or "CSV 同步任务").strip()[:128]
 
     try:
-        insert_job(
+        existing_job_id = insert_job(
             job_id,
             job_name,
             source_file_name,
@@ -293,25 +316,53 @@ def create_job(
             file_sha256,
             idempotency_key,
         )
+    except IdempotencyConflictError:
+        Path(stored_file_path).unlink(missing_ok=True)
+        api_error(409, "IDEMPOTENCY_KEY_CONFLICT", "相同幂等键对应了不同文件")
     except Exception as exc:
         Path(stored_file_path).unlink(missing_ok=True)
-        if getattr(exc, "args", [None])[0] == 1062 and idempotency_key:
-            existing = get_job_by_idempotency_key(idempotency_key)
-            if existing:
-                return {
-                    "data": serialize_job(get_job_or_error(existing["id"])),
-                    "meta": {"idempotent": True},
-                }
         logger.exception("Failed to insert job %s", job_id)
         api_error(500, "INTERNAL_ERROR", "任务创建失败")
 
+    if existing_job_id:
+        Path(stored_file_path).unlink(missing_ok=True)
+        return {
+            "data": serialize_job(get_job_or_error(existing_job_id)),
+            "meta": {"idempotent": True},
+        }
+
     try:
-        enqueue_job(job_id)
+        enqueue_job(job_id, attempt_no=1)
     except Exception:
         mark_job_failed(job_id, "QUEUE_UNAVAILABLE", "任务队列暂不可用")
         api_error(503, "QUEUE_UNAVAILABLE", "任务队列暂不可用")
 
     return {"data": serialize_job(get_job_or_error(job_id)), "meta": {}}
+
+
+@app.post(
+    "/api/v1/jobs/{job_id}/retry",
+    status_code=202,
+    response_model=ApiResponse[JobResponse],
+    tags=["jobs"],
+)
+def retry_job(job_id: str):
+    """Manually requeue a FAILED job as a fresh execution round."""
+    get_job_or_error(job_id)
+    retry_state = prepare_job_retry(job_id)
+    if retry_state is None:
+        api_error(404, "JOB_NOT_FOUND", "任务不存在")
+    if retry_state["status"] != "FAILED":
+        api_error(409, "JOB_NOT_RETRYABLE", "只有 FAILED 任务可以重新执行")
+    try:
+        enqueue_job(job_id, int(retry_state["attempt_no"]))
+    except Exception:
+        mark_job_failed(job_id, "QUEUE_UNAVAILABLE", "手动重试任务入队失败")
+        api_error(503, "QUEUE_UNAVAILABLE", "任务队列暂不可用")
+    return {
+        "data": serialize_job(get_job_or_error(job_id)),
+        "meta": {"previous_status": "FAILED", "manual_retry": True},
+    }
 
 
 @app.post(
@@ -327,10 +378,10 @@ def cancel_job(job_id: str):
         api_error(404, "JOB_NOT_FOUND", "任务不存在")
     if previous_status in TERMINAL_STATUSES:
         logger.warning("Invalid cancellation request job_id=%s status=%s", job_id, previous_status)
-        api_error(409, "INVALID_STATE_TRANSITION", "终态任务不能取消")
+        api_error(409, "JOB_NOT_CANCELABLE", "终态任务不能取消")
     if previous_status not in {"PENDING", "RUNNING", "RETRYING", "CANCELING"}:
         logger.warning("Invalid cancellation request job_id=%s status=%s", job_id, previous_status)
-        api_error(409, "INVALID_STATE_TRANSITION", "当前任务状态不支持取消")
+        api_error(409, "JOB_NOT_CANCELABLE", "当前任务状态不支持取消")
     return {
         "data": serialize_job(get_job_or_error(job_id)),
         "meta": {"previous_status": previous_status},
@@ -340,6 +391,17 @@ def cancel_job(job_id: str):
 @app.get("/api/v1/jobs/{job_id}", response_model=ApiResponse[JobResponse], tags=["jobs"])
 def get_job_detail(job_id: str):
     return {"data": serialize_job(get_job_or_error(job_id)), "meta": {}}
+
+
+@app.get(
+    "/api/v1/jobs/{job_id}/attempts",
+    response_model=ApiResponse[List[AttemptResponse]],
+    tags=["jobs"],
+)
+def get_job_attempts(job_id: str):
+    """Return the retry history so operators can inspect each execution."""
+    get_job_or_error(job_id)
+    return {"data": [serialize_attempt(item) for item in list_job_attempts(job_id)], "meta": {}}
 
 
 @app.get(

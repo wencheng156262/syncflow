@@ -29,6 +29,10 @@ PROCESSING_JOB_COLUMNS = JOB_COLUMNS + ", stored_file_path"
 NON_TERMINAL_STATUSES = ("PENDING", "RUNNING", "RETRYING", "CANCELING")
 
 
+class IdempotencyConflictError(Exception):
+    """Raised when one idempotency key is reused for a different file."""
+
+
 def get_db_connection():
     return pymysql.connect(
         host=MYSQL_HOST,
@@ -69,6 +73,7 @@ def get_job(job_id: str) -> Optional[Dict[str, Any]]:
 
 
 def get_job_by_idempotency_key(idempotency_key: str) -> Optional[Dict[str, Any]]:
+    """Return the legacy job lookup result for compatibility with old callers."""
     connection = get_db_connection()
     try:
         with connection.cursor() as cursor:
@@ -101,25 +106,146 @@ def insert_job(
     stored_file_path: str,
     file_sha256: str,
     idempotency_key: Optional[str],
-) -> None:
+) -> Optional[str]:
+    """Create a job or return the existing job protected by a valid key."""
+    key = idempotency_key[:128] if idempotency_key else None
+    for attempt in range(2):
+        try:
+            with transaction() as connection:
+                with connection.cursor() as cursor:
+                    if key:
+                        cursor.execute(
+                            """
+                            SELECT job_id, file_sha256, expires_at
+                            FROM job_idempotency_keys
+                            WHERE idempotency_key = %s
+                            FOR UPDATE
+                            """,
+                            (key,),
+                        )
+                        existing = cursor.fetchone()
+                        if existing and existing["expires_at"] > __import__("datetime").datetime.utcnow():
+                            if existing["file_sha256"] != file_sha256:
+                                raise IdempotencyConflictError(key)
+                            return str(existing["job_id"])
+                        if existing:
+                            cursor.execute(
+                                "UPDATE sync_jobs SET idempotency_key = NULL WHERE id = %s",
+                                (existing["job_id"],),
+                            )
+                            cursor.execute(
+                                "DELETE FROM job_idempotency_keys WHERE idempotency_key = %s",
+                                (key,),
+                            )
+                        cursor.execute(
+                            """
+                            INSERT INTO job_idempotency_keys
+                                (idempotency_key, job_id, file_sha256, expires_at)
+                            VALUES (%s, %s, %s, UTC_TIMESTAMP(3) + INTERVAL 24 HOUR)
+                            """,
+                            (key, job_id, file_sha256),
+                        )
+                    cursor.execute(
+                        """
+                        INSERT INTO sync_jobs
+                            (id, name, status, source_file_name, stored_file_path,
+                             file_sha256, idempotency_key)
+                        VALUES (%s, %s, 'PENDING', %s, %s, %s, %s)
+                        """,
+                        (job_id, name, source_file_name, stored_file_path, file_sha256, key),
+                    )
+                    return None
+        except pymysql.err.IntegrityError:
+            if not key or attempt == 1:
+                raise
+    return None
+
+
+def start_job_attempt(job_id: str, attempt_no: int) -> bool:
+    """Record the start of one concrete Worker attempt."""
     with transaction() as connection:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
-                INSERT INTO sync_jobs
-                    (id, name, status, source_file_name, stored_file_path,
-                     file_sha256, idempotency_key)
-                VALUES (%s, %s, 'PENDING', %s, %s, %s, %s)
+                INSERT IGNORE INTO job_attempts (job_id, attempt_no, status, started_at)
+                VALUES (%s, %s, 'RUNNING', UTC_TIMESTAMP(3))
                 """,
-                (
-                    job_id,
-                    name,
-                    source_file_name,
-                    stored_file_path,
-                    file_sha256,
-                    idempotency_key[:128] if idempotency_key else None,
-                ),
+                (job_id, attempt_no),
             )
+            return cursor.rowcount == 1
+
+
+def finish_job_attempt(
+    job_id: str,
+    attempt_no: int,
+    status: str,
+    error_code: Optional[str] = None,
+    error_message: Optional[str] = None,
+) -> bool:
+    """Close an attempt once with its final status and optional error."""
+    with transaction() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE job_attempts
+                SET status = %s, error_code = %s, error_message = %s,
+                    finished_at = UTC_TIMESTAMP(3)
+                WHERE job_id = %s AND attempt_no = %s AND finished_at IS NULL
+                """,
+                (status, error_code, error_message, job_id, attempt_no),
+            )
+            return cursor.rowcount == 1
+
+
+def list_job_attempts(job_id: str) -> List[Dict[str, Any]]:
+    """List attempt history in execution order for the detail page."""
+    connection = get_db_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, job_id, attempt_no, status, error_code,
+                       error_message, started_at, finished_at
+                FROM job_attempts
+                WHERE job_id = %s
+                ORDER BY attempt_no ASC
+                """,
+                (job_id,),
+            )
+            return cursor.fetchall()
+    finally:
+        connection.close()
+
+
+def prepare_job_retry(job_id: str) -> Optional[Dict[str, Any]]:
+    """Reset a failed job for a manual retry and return its next attempt number."""
+    with transaction() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT status FROM sync_jobs WHERE id = %s FOR UPDATE", (job_id,))
+            job = cursor.fetchone()
+            if job is None:
+                return None
+            if job["status"] != "FAILED":
+                return {"status": job["status"], "attempt_no": None}
+            cursor.execute(
+                "SELECT COALESCE(MAX(attempt_no), 0) AS latest_attempt FROM job_attempts WHERE job_id = %s",
+                (job_id,),
+            )
+            latest_attempt = int(cursor.fetchone()["latest_attempt"])
+            cursor.execute("DELETE FROM sync_records WHERE job_id = %s", (job_id,))
+            cursor.execute("DELETE FROM sync_errors WHERE job_id = %s", (job_id,))
+            cursor.execute(
+                """
+                UPDATE sync_jobs
+                SET status = 'PENDING', total_records = 0, success_records = 0,
+                    failed_records = 0, retry_count = 0, last_error_code = NULL,
+                    last_error_message = NULL, started_at = NULL, finished_at = NULL,
+                    updated_at = UTC_TIMESTAMP(3)
+                WHERE id = %s AND status = 'FAILED'
+                """,
+                (job_id,),
+            )
+            return {"status": "FAILED", "attempt_no": latest_attempt + 1}
 
 
 def list_jobs(

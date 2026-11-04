@@ -7,7 +7,7 @@ Week 4 聚焦 Worker 并发控制、任务状态一致性、取消和服务重�
 - 状态机增加 `RETRYING`、`CANCELING`，并限制所有状态转换必须带当前状态条件。
 - API 创建任务先持久化，再向 Redis List 投递 JSON 消息 `{job_id, attempt_no}`；投递失败会把任务标记为 `FAILED`。
 - Worker 使用 `BRPOP` 阻塞消费，使用原子 `PENDING -> RUNNING` 更新避免同一任务被多个 Worker 重复执行。
-- `WORKER_CONCURRENCY` 控制线程并发数，默认 2；`JOB_TIMEOUT_SECONDS` 控制单任务超时；失败任务最多按 `MAX_JOB_RETRIES` 次重新投递。
+- `WORKER_CONCURRENCY` 控制线程并发数，默认 2；`JOB_TIMEOUT_SECONDS` 控制单任务超时；失败任务最多按 `MAX_JOB_ATTEMPTS` 次执行（兼容旧配置名 `MAX_JOB_RETRIES`）。
 - Worker 收到 SIGTERM/SIGINT 后停止消费新任务，等待当前任务在批次边界结束；超时任务进入 `RETRYING` 并重新入队。
 - Worker 启动时扫描超时的 `RUNNING` 任务并恢复，避免服务重启留下无法解释的孤儿任务。
 - 任务详情页继续轮询 `PENDING`、`RUNNING`、`RETRYING`、`CANCELING`，并支持取消任务；进入终态或离开页面后停止轮询。
@@ -17,7 +17,7 @@ Week 4 聚焦 Worker 并发控制、任务状态一致性、取消和服务重�
 - `WORKER_CONCURRENCY`：Worker 并发任务数，默认 2。
 - `JOB_TIMEOUT_SECONDS`：单个任务执行超时时间，默认 300 秒。
 - `WORKER_SHUTDOWN_TIMEOUT_SECONDS`：优雅停止等待时间，默认 30 秒。
-- `MAX_JOB_RETRIES`：任务最大重试次数，默认 2 次。
+- `MAX_JOB_ATTEMPTS`：任务最大执行次数，默认 3 次；旧配置名 `MAX_JOB_RETRIES` 仍可作为兼容回退。
 
 ## 验收方式
 

@@ -12,6 +12,8 @@ Base URL：`/api/v1`。成功响应统一为 `{ "data": ..., "meta": ... }`，�
 | GET | `/api/v1/jobs` | 分页查询任务 | 200 |
 | GET | `/api/v1/jobs/{job_id}` | 查询任务详情 | 200 |
 | POST | `/api/v1/jobs/{job_id}/cancel` | 请求取消任务 | 202 |
+| POST | `/api/v1/jobs/{job_id}/retry` | 手动重试失败任务 | 202 |
+| GET | `/api/v1/jobs/{job_id}/attempts` | 查询每次执行尝试 | 200 |
 
 ## 创建任务
 
@@ -21,7 +23,7 @@ Base URL：`/api/v1`。成功响应统一为 `{ "data": ..., "meta": ... }`，�
 | --- | --- | --- |
 | `file` | 是 | `.csv` 文件，默认最大 10 MB |
 | `name` | 否 | 最长 128 字符；不传时使用文件名 |
-| `Idempotency-Key` | 否 | 请求头，最长 128 字符；相同键返回同一任务 |
+| `Idempotency-Key` | 否 | 请求头，最长 128 字符；24 小时内相同键和相同文件返回同一任务 |
 
 成功示例：
 
@@ -42,7 +44,13 @@ Base URL：`/api/v1`。成功响应统一为 `{ "data": ..., "meta": ... }`，�
 
 ## 取消任务
 
-`POST /api/v1/jobs/{job_id}/cancel` 不会强制杀死 Worker：`PENDING`/`RETRYING` 直接进入 `CANCELED`，`RUNNING` 先进入 `CANCELING`，由 Worker 在批次边界安全停止。终态任务取消返回 409 `INVALID_STATE_TRANSITION`。
+`POST /api/v1/jobs/{job_id}/cancel` 不会强制杀死 Worker：`PENDING`/`RETRYING` 直接进入 `CANCELED`，`RUNNING` 先进入 `CANCELING`，由 Worker 在批次边界安全停止。终态任务取消返回 409 `JOB_NOT_CANCELABLE`。
+
+## 手动重试
+
+`POST /api/v1/jobs/{job_id}/retry` 只接受 `FAILED` 任务，复用原任务和原文件，把结果清理后重新置为 `PENDING` 并入队。接口返回 409 `JOB_NOT_RETRYABLE` 表示当前状态不允许手动重试。
+
+`GET /api/v1/jobs/{job_id}/attempts` 返回每次执行的 `attempt_no`、状态、错误码、错误信息和时间，用于排查自动重试过程。
 
 ## 查询详情
 
@@ -68,6 +76,9 @@ Base URL：`/api/v1`。成功响应统一为 `{ "data": ..., "meta": ... }`，�
 | 404 | `JOB_NOT_FOUND` | 任务不存在 |
 | 503 | `DEPENDENCY_UNAVAILABLE` | MySQL 或 Redis 未就绪 |
 | 503 | `QUEUE_UNAVAILABLE` | 任务入队失败 |
+| 409 | `IDEMPOTENCY_KEY_CONFLICT` | 同一幂等键对应了不同文件 |
+| 409 | `JOB_NOT_RETRYABLE` | 当前任务不是 FAILED |
+| 409 | `JOB_NOT_CANCELABLE` | 当前任务不能取消 |
 | 500 | `INTERNAL_ERROR` | 未预期的内部错误 |
 
 错误消息面向用户，`details` 只放可行动的字段或参数信息，不放敏感内部细节。

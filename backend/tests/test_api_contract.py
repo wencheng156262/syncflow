@@ -83,3 +83,10 @@ def test_openapi_exposes_week3_error_endpoint():
 
 def test_openapi_exposes_week4_cancel_endpoint():
     assert "/api/v1/jobs/{job_id}/cancel" in app.openapi()["paths"]
+
+
+def test_openapi_exposes_week5_retry_and_attempt_endpoints():
+    paths = app.openapi()["paths"]
+
+    assert "/api/v1/jobs/{job_id}/retry" in paths
+    assert "/api/v1/jobs/{job_id}/attempts" in paths
